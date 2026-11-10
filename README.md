@@ -12,6 +12,26 @@ pip install git+https://github.com/Optimus2007/nantrace
 
 It needs Python 3.10 or newer and PyTorch 2.4 or newer. It is not on PyPI yet.
 
+## Use it with a coding agent
+
+nantrace ships an MCP server and an agent skill, so Claude Code, Cursor, Codex and other agents can trace a NaN, read a short JSON answer (about 1 KB), and fix the right line instead of wrapping the loss in `nan_to_num`.
+
+```bash
+pip install "nantrace[mcp] @ git+https://github.com/Optimus2007/nantrace"
+
+# Claude Code: use the python of the environment that has your project's torch
+claude mcp add nantrace -- /path/to/venv/bin/python -m nantrace mcp
+nantrace install-skill            # adds .claude/skills/nantrace/SKILL.md to this project
+```
+
+For Cursor, add this to `.cursor/mcp.json` (other MCP clients take the same command):
+
+```json
+{"mcpServers": {"nantrace": {"command": "/path/to/venv/bin/python", "args": ["-m", "nantrace", "mcp"]}}}
+```
+
+The server has two tools. `trace_nan(script)` runs a script with every op traced and returns the cause: op, line, line inside the library, input ranges, why, and a fix. `fuzz(path)` tests the functions in a fuzz file on edge case inputs. Each call runs in its own process with a timeout, so a crash or a hang in your code cannot take the server down. Without MCP, the agent can call the same thing from the shell: `nantrace run --brief repro.py`.
+
 ```
 nantrace: step 137: loss is nan and 6 parameter gradients are not finite (q.weight, q.bias, k.weight ...)
 
@@ -63,11 +83,12 @@ The check runs before `optimizer.step()`, so the weights are still the ones that
 
 ```bash
 nantrace run train.py --steps 50       # stops at the first NaN, exit code 3
-nantrace run --json train.py           # machine readable report for agents and CI
+nantrace run --brief train.py          # short JSON, sized for agents
+nantrace run --json train.py           # full JSON report for CI
 nantrace run --stop any train.py       # also stop at the first inf
 ```
 
-No code changes. Every op is checked, so use it on a short reproduction.
+No code changes. Every op is checked, so use it on a short reproduction. Exit codes: 0 nothing found, 3 NaN, 4 an Inf that is still alive at the end (such as an infinite loss), 1 the script failed for another reason.
 
 ### 3. Around any block: `trace`
 
@@ -85,6 +106,12 @@ findings = nantrace.fuzz(my_loss, logits, targets)
 assert not findings, "\n\n".join(map(str, findings))
 ```
 
+Or from the command line, with a file of `fuzz_` functions that each return the function and a valid example input (see `examples/fuzz_checks.py`):
+
+```bash
+nantrace fuzz examples/fuzz_checks.py
+```
+
 Starting from one valid example input, `fuzz` tries edge cases on each argument: zeros, constant values, huge and tiny values, negative values, a batch of one, float16 and bfloat16, masks with a fully masked row, and integer targets that are all one value (such as `ignore_index=-100`). Each try runs forward and backward under the tracer, and every NaN or Inf is reported with its root cause. Put it in a unit test to catch the edge cases users would otherwise report as issues.
 
 From valid inputs, `fuzz` found the bug behind 7 real issues (`benchmarks/realworld/fuzz_rediscover.py`), for example:
@@ -97,6 +124,18 @@ pytorch#201627 gumbel_softmax: when arg 0 is float16 with values up to 25% of th
 ```
 
 and reported nothing for 5 numerically safe functions, including the fixed version of the TorchRL weighting.
+
+### 5. PyTorch Lightning and Hugging Face
+
+```python
+from nantrace.integrations.lightning import NantraceCallback
+trainer = L.Trainer(callbacks=[NantraceCallback()])
+
+from nantrace.integrations.hf import NantraceTrainer
+trainer = NantraceTrainer(model=model, args=args, train_dataset=ds)   # same arguments as Trainer
+```
+
+Both check the gradients after every backward pass (the Trainer also checks the loss) and, when something is NaN or Inf, replay that batch under the tracer and raise `NonFiniteError` with the report. With fp16 and a GradScaler the gradient check is off by default, because the scaler expects inf gradients now and then.
 
 ## What it diagnoses
 
@@ -129,7 +168,7 @@ Run unchanged on the TorchRL reproduction script, nantrace points to `torchrl/mo
 
 ## Limits
 
-* Tested so far on PyTorch 2.15 with Python 3.13, on CPU and Apple MPS. Not yet tested on CUDA or with multiple GPUs. Reports from CUDA users are very welcome.
+* Tested so far on PyTorch 2.15 with Python 3.13, on CPU and Apple MPS, with Lightning 2.6 and Transformers 5.22. Not yet tested on CUDA or with multiple GPUs. If you have a GPU, [`examples/cuda_check.ipynb`](examples/cuda_check.ipynb) runs the test suite on Colab in one click, and reports are very welcome.
 * The replay needs the step to be repeatable. Nondeterministic GPU kernels or random data augmentation inside the step can make the NaN disappear on replay; nantrace says so when that happens.
 * Code inside `torch.compile` is not traced op by op yet.
 * With `GradScaler`, pass `check_grads=False`; inf gradients are expected there and the scaler skips those steps.
@@ -143,7 +182,7 @@ Run unchanged on the TorchRL reproduction script, nantrace points to `torchrl/mo
 
 ## For coding agents
 
-`skills/nantrace/SKILL.md` teaches an agent (Claude Code, Cursor and others) to run `nantrace run --json`, read the origin, and fix the line.
+`skills/nantrace/SKILL.md` (installed by `nantrace install-skill`) teaches an agent when to use nantrace, how to read the JSON, and to prefer stable builtins over hiding the NaN. See the agent section at the top for MCP setup.
 
 ## License
 

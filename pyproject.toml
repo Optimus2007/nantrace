@@ -12,8 +12,14 @@ license = "MIT"
 dependencies = ["torch>=2.4"]
 keywords = ["pytorch", "nan", "debugging", "numerical stability", "deep learning"]
 
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+
 [project.scripts]
 nantrace = "nantrace.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+nantrace = ["SKILL.md"]

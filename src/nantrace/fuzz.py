@@ -49,7 +49,7 @@ class Finding:
         return (o.op if o else None, loc.file if loc else None, loc.line if loc else None)
 
     def __str__(self) -> str:
-        head = f"nantrace.fuzz: {self.where} becomes not finite when {self.mutation}"
+        head = f"nantrace.fuzz: {self.where} becomes NaN or Inf when {self.mutation}"
         if self.also:
             head += f" (also: {', '.join(self.also[:4])})"
         return head + "\n" + self.report.text()

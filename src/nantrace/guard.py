@@ -96,35 +96,54 @@ class Guard:
         for m in self.models:
             yield from m.named_buffers()
 
-    def _check(self, loss: torch.Tensor) -> tuple[bool, list[str]]:
-        """One fused reduction and one device sync for the loss and all gradients."""
+    def check(self, loss: torch.Tensor | None = None) -> tuple[bool, list[str]]:
+        """Is the loss (if given) or any gradient not finite? One fused reduction, one device sync.
+
+        Returns (loss_bad, names of parameters whose gradient is not finite).
+        """
         named = [(n, p.grad) for n, p in self._params() if p.grad is not None] if self.check_grads else []
-        vals = [loss.detach().float().sum().reshape(1)]
+        vals = [loss.detach().float().sum().reshape(1)] if loss is not None else []
         if named:
             vals.append(torch.stack([v.float() for v in torch._foreach_norm([g for _, g in named])]))
+        if not vals:
+            return False, []
         allv = torch.cat(vals)
         if bool(torch.isfinite(allv.sum())):
             return False, []
         flags = torch.isfinite(allv).tolist()
-        return not flags[0], [n for (n, _), ok in zip(named, flags[1:]) if not ok]
+        loss_bad = loss is not None and not flags[0]
+        grad_flags = flags[1:] if loss is not None else flags
+        return loss_bad, [n for (n, _), ok in zip(named, grad_flags) if not ok]
 
-    def step(self, fn: Callable[..., torch.Tensor], *args, **kwargs) -> torch.Tensor | None:
+    _check = check
+
+    def begin(self) -> None:
+        """Remember the RNG state and module buffers at the start of a step."""
         self.steps += 1
-        rng = _rng_state()
-        buffers = {n: b.detach().clone() for n, b in self._buffers()}
+        self._rng = _rng_state()
+        self._snap = {n: b.detach().clone() for n, b in self._buffers()}
 
-        loss = fn(*args, **kwargs)
-        loss.backward()
+    def handle(self, fn: Callable[..., torch.Tensor], args=(), kwargs=None, loss=None, loss_bad=False, bad_grads=()) -> Report:
+        """Replay the step that just failed under the tracer, then raise or report.
 
-        loss_bad, bad_grads = self._check(loss)
-        if not loss_bad and not bad_grads:
-            return loss.detach()
-
-        report = self._replay(fn, args, kwargs, rng, buffers, loss, loss_bad, bad_grads)
+        `fn(*args, **kwargs)` must recompute the loss of that step, as at the start of it.
+        """
+        report = self._replay(fn, args, kwargs or {}, self._rng, self._snap, loss, loss_bad, list(bad_grads))
         self.reports.append(report)
         if self.on_error == "raise":
             raise NonFiniteError(report)
         self._report_fn(report)
+        return report
+
+    def step(self, fn: Callable[..., torch.Tensor], *args, **kwargs) -> torch.Tensor | None:
+        self.begin()
+        loss = fn(*args, **kwargs)
+        loss.backward()
+
+        loss_bad, bad_grads = self.check(loss)
+        if not loss_bad and not bad_grads:
+            return loss.detach()
+        self.handle(fn, args, kwargs, loss, loss_bad, bad_grads)
         return None
 
     def _restore(self, rng: dict, buffers: dict) -> None:
@@ -136,7 +155,7 @@ class Guard:
 
     def _replay(self, fn, args, kwargs, rng, buffers, loss, loss_bad, bad_grads) -> Report:
         what = []
-        if loss_bad:
+        if loss_bad and loss is not None:
             what.append(f"loss is {loss.detach().float().reshape(-1)[0].item()}")
         if bad_grads:
             shown = ", ".join(bad_grads[:3]) + (" ..." if len(bad_grads) > 3 else "")

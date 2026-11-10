@@ -536,6 +536,40 @@ class Report:
             "context": self.context,
         }
 
+    def brief(self) -> dict:
+        """A short summary sized for an agent's context window."""
+
+        def loc(f: Frame | None) -> dict | None:
+            return {"file": f.file, "line": f.line, "code": f.code} if f else None
+
+        out: dict = {"found": self.found, "summary": self.context.get("summary") or self.context.get("not_found")}
+        e = self.cause_event
+        if e is None:
+            out["summary"] = out["summary"] or "no op created NaN or Inf from finite inputs"
+            return out
+        last = self.chain[-1]
+        if not out["summary"]:
+            out["summary"] = f"{last.kind} first appeared in the {last.phase} pass"
+        out["cause"] = {
+            "op": e.op,
+            "phase": e.phase,
+            "grad_fn": e.grad_fn,
+            "location": loc(e.location),
+            "inside_library": loc(e.inner),
+            "inside_custom_op": [loc(x.inner or x.location) for x in e.inside] or None,
+            "inputs": [s.short() for s in e.inputs[:3]],
+            "why": e.cause,
+            "fix": e.fix,
+        }
+        out["cause"] = {k: v for k, v in out["cause"].items() if v not in (None, [], "")}
+        out["chain"] = [
+            f"{x.phase} {x.op} -> {x.kind}" + (f" at {x.location.short()}" if x.location else "") + ("  [mask, likely intended]" if x.intended else "")
+            for x in self.chain
+        ]
+        if self.other_origins:
+            out["other_origins"] = self.other_origins
+        return {k: v for k, v in out.items() if v is not None}
+
     def text(self) -> str:
         lines = []
         ctx = self.context

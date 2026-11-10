@@ -245,3 +245,58 @@ def test_fuzz_skips_mutations_that_overflow_the_input():
 def test_fuzz_reports_bad_example_input():
     found = nantrace.fuzz(lambda x: x.log(), torch.zeros(2))
     assert found and found[0].mutation.startswith("the example input")
+
+
+# command line and agent support ---------------------------------------------
+
+import json
+import os
+import subprocess
+import sys
+
+EXAMPLES = os.path.join(os.path.dirname(__file__), "..", "examples")
+
+
+def _cli(*args, cwd=EXAMPLES):
+    return subprocess.run([sys.executable, "-m", "nantrace", *args], cwd=cwd, capture_output=True, text=True)
+
+
+def test_skill_copies_match():
+    root = os.path.join(os.path.dirname(__file__), "..")
+    a = open(os.path.join(root, "src", "nantrace", "SKILL.md")).read()
+    b = open(os.path.join(root, "skills", "nantrace", "SKILL.md")).read()
+    assert a == b
+
+
+def test_cli_brief_json_is_clean_and_short():
+    p = _cli("run", "--brief", "softmax_overflow.py")
+    assert p.returncode == 3
+    r = json.loads(p.stdout)  # the script's own prints went to stderr
+    assert r["cause"]["op"] == "aten.exp.default" and r["cause"]["location"]["line"] == 9
+    assert len(p.stdout) < 3000
+
+
+def test_cli_fuzz_file(tmp_path):
+    f = tmp_path / "fuzz_checks.py"
+    f.write_text(
+        "import torch\n"
+        "def fuzz_unshifted_softmax():\n"
+        "    return (lambda v: v.exp() / v.exp().sum()), (torch.randn(5),)\n"
+        "def fuzz_safe_softmax():\n"
+        "    return (lambda v: torch.softmax(v, 0)), (torch.randn(5),)\n"
+    )
+    p = _cli("fuzz", "--json", str(f), cwd=str(tmp_path))
+    assert p.returncode == 3
+    r = json.loads(p.stdout)
+    counts = {t["target"]: len(t["findings"]) for t in r["targets"]}
+    assert counts["fuzz_safe_softmax"] == 0 and counts["fuzz_unshifted_softmax"] >= 1
+
+
+def test_install_skill_does_not_overwrite(tmp_path):
+    assert _cli("install-skill", "--dir", str(tmp_path)).returncode == 0
+    dest = tmp_path / "nantrace" / "SKILL.md"
+    assert dest.exists()
+    assert _cli("install-skill", "--dir", str(tmp_path)).returncode == 0  # same content
+    dest.write_text("my own edits")
+    assert _cli("install-skill", "--dir", str(tmp_path)).returncode == 2
+    assert dest.read_text() == "my own edits"
