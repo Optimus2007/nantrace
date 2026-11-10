@@ -12,6 +12,7 @@ that already went wrong.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import sysconfig
@@ -80,26 +81,47 @@ def _is_user_file(path: str) -> bool:
     return not os.path.realpath(path).startswith(_SKIP_DIRS)
 
 
-def _forward_frames() -> list[Frame]:
-    frames = [
-        Frame(f.filename, f.lineno or 0, f.name, (f.line or "").strip())
-        for f in traceback.extract_stack()
-        if _is_user_file(f.filename)
-    ]
-    return frames
+_TORCH_DIR = os.path.realpath(os.path.dirname(torch.__file__)) + os.sep
+_OWN_DIRS = tuple(d for d in _SKIP_DIRS if not d.startswith(_TORCH_DIR) and d != _TORCH_DIR)
 
 
-def _backward_frames(node) -> list[Frame]:
+def _is_library_frame(path: str) -> bool:
+    """Python source that explains the op: user code or public torch modules, not dispatch plumbing."""
+    if path.startswith("<"):
+        return False
+    real = os.path.realpath(path)
+    if real.startswith(_OWN_DIRS):
+        return False
+    if real.startswith(_TORCH_DIR):
+        rel = real[len(_TORCH_DIR):]
+        return not (rel.startswith(("_", "utils" + os.sep + "_", "autograd" + os.sep)) or rel in ("overrides.py",))
+    return True
+
+
+def _split(frames: list[Frame]) -> tuple[list[Frame], Frame | None]:
+    user = [f for f in frames if _is_user_file(f.file)]
+    lib = [f for f in frames if _is_library_frame(f.file)]
+    inner = lib[-1] if lib else None
+    if inner is not None and user and inner.file == user[-1].file and inner.line == user[-1].line:
+        inner = None
+    return user, inner
+
+
+def _forward_frames() -> tuple[list[Frame], Frame | None]:
+    return _split([Frame(f.filename, f.lineno or 0, f.name, (f.line or "").strip()) for f in traceback.extract_stack()])
+
+
+def _backward_frames(node) -> tuple[list[Frame], Frame | None]:
     tb = node.metadata.get("traceback_") if node is not None else None
     if not tb:
-        return []
+        return [], None
     entries = tb if isinstance(tb, list) else re.split(r"(?m)^(?=\s*File \")", str(tb))
     frames = []
     for entry in entries:  # one frame per entry; frozen frames have no code line
         m = _TB_RE.search(entry)
-        if m and _is_user_file(m.group(1)):
+        if m:
             frames.append(Frame(m.group(1), int(m.group(2)), m.group(3).strip(), (m.group(4) or "").strip()))
-    return frames
+    return _split(frames)
 
 
 @dataclass(eq=False)
@@ -111,12 +133,16 @@ class Event:
     output: TensorStats | None
     inputs: list[TensorStats] = field(default_factory=list)
     location: Frame | None = None
+    inner: Frame | None = None  # innermost library line (for example in torch/nn/functional.py)
     stack: list[Frame] = field(default_factory=list)
+    inside: list["Event"] = field(default_factory=list)  # chain found inside a custom op
     module: str | None = None
     grad_fn: str | None = None
     cause: str = ""
     fix: str = ""
     parent: "Event | None" = None
+    intended: bool = False  # -inf written on purpose, such as an attention mask
+    aux: bool = False  # only in a secondary output (like attention weights) that may never be used
 
     @property
     def is_origin(self) -> bool:
@@ -131,11 +157,14 @@ class Event:
             "output": self.output.to_dict() if self.output else None,
             "inputs": [s.to_dict() for s in self.inputs],
             "location": self.location.to_dict() if self.location else None,
+            "inner": self.inner.to_dict() if self.inner else None,
+            "inside_custom_op": [e.to_dict() for e in self.inside],
             "stack": [f.to_dict() for f in self.stack],
             "module": self.module,
             "grad_fn": self.grad_fn,
             "cause": self.cause,
             "fix": self.fix,
+            "likely_intended": self.intended,
         }
 
 
@@ -260,7 +289,14 @@ class Tracer(TorchDispatchMode):
 
     def _external(self, t: torch.Tensor) -> Event:
         name = self.names.get(id(t))
-        if name:
+        st = stats(t)
+        frames, inner = _forward_frames()
+        if not name and st.nan == 0 and st.posinf == 0:
+            cause = (
+                "a tensor holding -inf was created outside the traced ops (for example a mask built "
+                "with torch.tensor or float('-inf')); that is usually intended"
+            )
+        elif name:
             cause = f"'{name}' was already non-finite before this code ran (often a previous optimizer step)"
         else:
             cause = (
@@ -272,9 +308,12 @@ class Tracer(TorchDispatchMode):
             phase="input",
             op=f"<input {name}>" if name else "<input>",
             kind=_kind([t]),
-            output=stats(t),
+            output=st,
+            location=frames[-1] if frames else None,
+            inner=inner,
             cause=cause,
             fix="check the data pipeline and earlier steps; nantrace.Guard catches this one step earlier",
+            intended=not name and st.nan == 0 and st.posinf == 0,
         )
         self._add(ev)
         self._register(t, ev)
@@ -283,7 +322,7 @@ class Tracer(TorchDispatchMode):
     def _add(self, ev: Event) -> None:
         if len(self.events) < self.max_events:
             self.events.append(ev)
-        if "nan" in ev.kind and self.first_nan is None:
+        if "nan" in ev.kind and self.first_nan is None and not ev.aux:
             self.first_nan = ev
 
     # the hook ----------------------------------------------------------------
@@ -320,15 +359,25 @@ class Tracer(TorchDispatchMode):
                 parent = src
 
         out_kind = _kind(bad_outs)
+        node_now = torch._C._current_autograd_node()
+        aux = node_now is None and len(outs) > 1 and all(t is not outs[0] for t in bad_outs)
         input_has_nan = any(k and "nan" in k for k in pre_kind)
         if parent is not None and not ("nan" in out_kind and not input_has_nan):
             for t in bad_outs:  # plain propagation
                 self._register(t, parent)
+            aux_src = next((e for e in self._ancestors(parent) if e.aux), None)
+            if aux_src is not None:  # a secondary output turned out to be used
+                for e in self._ancestors(parent):
+                    e.aux = False
+                if "nan" in parent.kind and self.first_nan is None:
+                    self.first_nan = parent
+                    if self.stop in ("nan", "any"):
+                        raise NonFiniteError(self.report(parent))
             return out
 
         node = torch._C._current_autograd_node()
         phase = "backward" if node is not None else "forward"
-        frames = _backward_frames(node) if node is not None else _forward_frames()
+        frames, inner = _backward_frames(node) if node is not None else _forward_frames()
         inputs = [s if s is not None else stats(t) for t, s in zip(in_t, pre_stats or [None] * len(in_t))]
         out_stats = stats(bad_outs[0])
         f64, f64_max = (None, None)
@@ -336,7 +385,12 @@ class Tracer(TorchDispatchMode):
             f64, f64_max = _recompute_float64(func, args, kwargs)
         grad_fn = type(node).__name__ if node is not None else None
         op = str(func)
-        cause, fix = diagnose(op, phase, inputs, out_stats, grad_fn, f64, f64_max)
+        consts = [v for v in tree_leaves((args, kwargs)) if isinstance(v, float) and not math.isfinite(v)]
+        cause, fix = diagnose(op, phase, inputs, out_stats, grad_fn, f64, f64_max, consts if parent is None else [])
+        inside = self._look_inside(func, args, kwargs) if parent is None and func.namespace not in ("aten", "prims") else []
+        if inside:
+            cause = f"inside the custom op {op}: {inside[-1].cause}"
+            fix = inside[0].fix or fix
         if parent is None and "0 / 0" in cause:
             u = next((u for u in reversed(self.underflows) if self.n_ops - u["index"] <= 200 and u["phase"] == phase), None)
             if u is not None:
@@ -355,7 +409,11 @@ class Tracer(TorchDispatchMode):
             output=out_stats,
             inputs=inputs,
             location=frames[-1] if frames else None,
+            inner=inner,
             stack=frames[-6:],
+            inside=inside,
+            intended=bool(consts) and parent is None and not any(math.isnan(v) for v in consts),
+            aux=aux,
             module=self._modules[-1] if self._modules and phase == "forward" else None,
             grad_fn=grad_fn,
             cause=cause,
@@ -366,9 +424,45 @@ class Tracer(TorchDispatchMode):
         for t in bad_outs:
             self._register(t, ev)
 
-        if self.stop == "any" or (self.stop == "nan" and "nan" in out_kind):
+        if not aux and (self.stop == "any" or (self.stop == "nan" and "nan" in out_kind)):
             raise NonFiniteError(self.report(ev))
         return out
+
+    def live_events(self) -> set:
+        """Events whose non-finite tensors are still referenced somewhere."""
+        live = set()
+        for ref, ev in self._by_id.values():
+            t = ref()
+            if t is not None and has_nonfinite(t):
+                live.update(self._ancestors(ev))
+        return live
+
+    @staticmethod
+    def _ancestors(ev: Event):
+        while ev is not None:
+            yield ev
+            ev = ev.parent
+
+    def _look_inside(self, func, args, kwargs) -> list[Event]:
+        """Run the Python implementation of a custom op under a nested tracer."""
+        try:
+            from torch._library.custom_ops import _maybe_get_opdef
+
+            opdef = _maybe_get_opdef(func)
+        except Exception:
+            opdef = None
+        impl = getattr(opdef, "_init_fn", None)
+        if impl is None:
+            return []
+        sub = Tracer()
+        sub.names = self.names
+        try:
+            with sub:
+                impl(*args, **kwargs)
+        except Exception:
+            pass
+        rep = sub.report()
+        return rep.chain
 
     def _note_underflow(self, func, in_t, out_t, pre_stats) -> None:
         if not in_t or out_t.numel() == 0 or out_t.dtype not in _TINY:
@@ -379,7 +473,7 @@ class Tracer(TorchDispatchMode):
                 return
             lo = pre_stats[0].min if pre_stats and pre_stats[0] is not None else float(x.detach().min())
         node = torch._C._current_autograd_node()
-        frames = _backward_frames(node) if node is not None else _forward_frames()
+        frames, _ = _backward_frames(node) if node is not None else _forward_frames()
         self.underflows.append({
             "index": self.n_ops,
             "phase": "backward" if node is not None else "forward",
@@ -398,7 +492,7 @@ class Tracer(TorchDispatchMode):
 
     def report(self, target: Event | None = None, context: dict | None = None) -> "Report":
         if target is None:
-            target = self.first_nan or next((e for e in self.events if e.is_origin), None)
+            target = self.first_nan or next((e for e in self.events if e.is_origin and not e.aux), None)
         chain = []
         e = target
         while e is not None:
@@ -425,10 +519,16 @@ class Report:
     def origin(self) -> Event | None:
         return self.chain[0] if self.chain else None
 
+    @property
+    def cause_event(self) -> Event | None:
+        """The first step that is a bug, skipping intended -inf masks at the start of the chain."""
+        return next((e for e in self.chain if not e.intended), self.origin)
+
     def to_dict(self) -> dict:
         return {
             "found": self.found,
             "origin": self.origin.to_dict() if self.origin else None,
+            "cause": self.cause_event.to_dict() if self.cause_event else None,
             "chain": [e.to_dict() for e in self.chain],
             "ops_traced": self.n_ops,
             "other_origins": self.other_origins,
@@ -452,6 +552,8 @@ class Report:
             lines.append(f"nantrace: {last.kind} first appeared in the {last.phase} pass (op {last.index} of {self.n_ops})")
         for i, e in enumerate(self.chain, 1):
             label = "origin" if i == 1 else "then"
+            if e.intended:
+                label = "mask"
             out = f"{e.output.short()}" if e.output else ""
             lines.append("")
             lines.append(f"  {i}. {label:<6} {e.phase:<8} {e.op}  ->  {out}")
@@ -462,6 +564,15 @@ class Report:
                 lines.append(f"     {tag:<8} {e.location.short()}")
                 if e.location.code:
                     lines.append(f"              {e.location.code}")
+            if e.inner:
+                lines.append(f"     inside   {e.inner.short()}")
+                if e.inner.code:
+                    lines.append(f"              {e.inner.code}")
+            for sub in e.inside:
+                where = sub.inner or sub.location
+                lines.append(f"     custom op step: {sub.op} at {where.short() if where else '?'}")
+                if where and where.code:
+                    lines.append(f"              {where.code}")
             if e.module:
                 lines.append(f"     module   {e.module}")
             for j, s in enumerate(e.inputs[:4]):

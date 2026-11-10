@@ -18,7 +18,8 @@ import sys
 
 from .tracer import NonFiniteError, Tracer
 
-EXIT_FOUND = 3
+EXIT_FOUND = 3  # NaN found
+EXIT_INF = 4  # no NaN, but inf created by something other than a mask
 
 
 def _run(argv: list[str]) -> int:
@@ -36,12 +37,13 @@ def _run(argv: list[str]) -> int:
     tracer = Tracer(stop=ns.stop)
     report = None
     error = None
+    keep = None  # the script's globals, so its tensors stay alive for the final check
     try:
         with tracer:
             if ns.module:
-                runpy.run_module(ns.target, run_name="__main__", alter_sys=True)
+                keep = runpy.run_module(ns.target, run_name="__main__", alter_sys=True)
             else:
-                runpy.run_path(ns.target, run_name="__main__")
+                keep = runpy.run_path(ns.target, run_name="__main__")
     except NonFiniteError as e:
         report = e.report
     except SystemExit:
@@ -51,6 +53,15 @@ def _run(argv: list[str]) -> int:
 
     if report is None and tracer.first_nan is not None:
         report = tracer.report()
+    inf_only = False
+    if report is None:  # no NaN, but an inf that is not a mask can still break training
+        # Only infs that survive in a live tensor (a loss, a gradient, an output). Temporary infs
+        # that PyTorch masks away inside its own formulas are not a problem.
+        live = tracer.live_events()
+        ev = next((e for e in tracer.events if e.is_origin and not e.intended and not e.aux and e in live), None)
+        if ev is not None:
+            inf_only = True
+            report = tracer.report(ev, {"summary": f"no NaN, but {ev.op} created inf from finite values"})
     if report is None and error is not None:
         raise error
 
@@ -61,6 +72,9 @@ def _run(argv: list[str]) -> int:
         print(report.text(), file=sys.stderr)
     else:
         print(f"nantrace: no NaN found ({tracer.n_ops} ops traced)", file=sys.stderr)
+    del keep
+    if inf_only:
+        return EXIT_INF
     return EXIT_FOUND if report and report.found else 0
 
 

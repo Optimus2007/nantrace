@@ -2,10 +2,11 @@
 
 from contextlib import contextmanager
 
+from .fuzz import Finding, fuzz
 from .guard import Guard
 from .tracer import Event, NonFiniteError, Report, Tracer
 
-__all__ = ["Guard", "Tracer", "Report", "Event", "NonFiniteError", "trace"]
+__all__ = ["Guard", "Tracer", "Report", "Event", "NonFiniteError", "trace", "fuzz", "Finding"]
 __version__ = "0.1.0"
 
 

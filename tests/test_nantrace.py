@@ -212,3 +212,36 @@ def test_guard_is_transparent_when_fine():
     guard = Guard(net)
     loss = guard.step(lambda: net(torch.ones(2, 3)).pow(2).mean())
     assert math.isfinite(loss.item()) and net.weight.grad is not None
+
+
+# fuzz -----------------------------------------------------------------------
+
+
+def test_fuzz_finds_unshifted_softmax_but_not_the_fix():
+    v, a = torch.randn(8, 1), torch.randn(8, 1)
+    buggy = nantrace.fuzz(lambda v, a: (v.exp() * a).sum(0) / v.exp().sum(0), v, a)
+    assert buggy and "exp overflow" in buggy[0].report.cause_event.cause
+    assert nantrace.fuzz(lambda v, a: (torch.softmax(v, 0) * a).sum(0), v, a) == []
+
+
+def test_fuzz_finds_empty_mask_mean():
+    f = torch.randn(6, 3)
+    labels = torch.tensor([1, 0, 1, 0, 1, 0])
+    found = nantrace.fuzz(lambda f, lbl: f[lbl.bool()].mean(0), f, labels)
+    assert any("empty" in x.report.cause_event.cause for x in found)
+
+
+def test_fuzz_finds_gradient_only_bug():
+    found = nantrace.fuzz(lambda x: torch.sqrt(x).sum(), torch.rand(4) + 1)
+    assert any(x.where == "gradient" for x in found)
+
+
+def test_fuzz_skips_mutations_that_overflow_the_input():
+    # x * 1e4 of a float16 input near its limit would be inf before fn runs
+    found = nantrace.fuzz(lambda x: x * 1.0, torch.full((3,), 60000.0, dtype=torch.float16))
+    assert found == []
+
+
+def test_fuzz_reports_bad_example_input():
+    found = nantrace.fuzz(lambda x: x.log(), torch.zeros(2))
+    assert found and found[0].mutation.startswith("the example input")

@@ -68,6 +68,26 @@ with nantrace.trace(model) as tr:
 print(tr.explain(loss))           # or tr.explain(param.grad)
 ```
 
+### 4. Before training, in tests: `fuzz`
+
+```python
+findings = nantrace.fuzz(my_loss, logits, targets)
+assert not findings, "\n\n".join(map(str, findings))
+```
+
+Starting from one valid example input, `fuzz` tries edge cases on each argument: zeros, constant values, huge and tiny values, negative values, a batch of one, float16 and bfloat16, masks with a fully masked row, and integer targets that are all one value (such as `ignore_index=-100`). Each try runs forward and backward under the tracer, and every NaN or Inf is reported with its root cause. Put it in a unit test to catch the edge cases users would otherwise report as issues.
+
+From valid inputs, `fuzz` found the bug behind 7 real issues (`benchmarks/realworld/fuzz_rediscover.py`), for example:
+
+```
+pytorch#201658 linear_cross_entropy: when arg 2 (integer) is all -100
+   origin  inside the custom op: where writes the constant nan, at torch/nn/modules/linear_cross_entropy.py:87
+pytorch#201627 gumbel_softmax: when arg 0 is float16 with values up to 25% of the float16 limit
+   origin  aten.div at torch/nn/functional.py:2277, float16 overflow (the exact result reaches 1.638e+05)
+```
+
+and reported nothing for 5 numerically safe functions, including the fixed version of the TorchRL weighting.
+
 ## What it diagnoses
 
 * `exp` overflow, and `exp` underflow that later becomes 0 / 0 (for example softmax weights that all round to 0)
@@ -78,6 +98,10 @@ print(tr.explain(loss))           # or tr.explain(param.grad)
 * softmax over a fully masked row
 * float16 and bfloat16 overflow, with the exact value computed again in float64
 * NaN that was already in the data or a parameter, named by parameter
+
+## Tested on real bugs
+
+`benchmarks/realworld/` holds the reproducers from 10 public NaN issues (PyTorch, DeepChem, a GNN research repo and others) plus 4 controls that are fixed upstream. `nantrace run` gives the root cause stated in the issue for all 10 and reports nothing for the 4 controls. See `benchmarks/realworld/RESULTS.md`.
 
 ## Real bug found with it
 

@@ -32,6 +32,7 @@ def diagnose(
     grad_fn: str | None = None,
     finite_in_float64: bool | None = None,
     float64_absmax: float | None = None,
+    constants: list[float] | None = None,
 ) -> tuple[str, str]:
     """Return (cause, fix) as plain sentences."""
     name = op.split(".")[1] if op.startswith("aten.") else op
@@ -44,6 +45,20 @@ def diagnose(
     bw = phase == "backward"
     where = f" while computing a gradient ({grad_fn})" if bw and grad_fn else ""
 
+    # The op was handed a NaN or inf constant, for example masked_fill(mask, -inf) or where(c, nan, x).
+    if constants and not inputs_nonfinite:
+        vals = ", ".join(sorted({str(v) for v in constants}))
+        if any(math.isnan(v) for v in constants):
+            return (
+                f"{name} writes the constant {vals} into the tensor (it is passed in as an argument){where}",
+                "if NaN is meant as a marker, make sure masked or ignored entries never reach the loss or "
+                "its gradient; otherwise use a finite value",
+            )
+        return (
+            f"{name} writes the constant {vals} into the tensor (usually a mask){where}",
+            "fine if every row keeps at least one finite entry; otherwise use torch.finfo(dtype).min",
+        )
+
     # Backward origins: the autograd node says which forward op this gradient belongs to.
     if bw and grad_fn and not inputs_nonfinite:
         hit = _backward_rule(grad_fn, makes_nan)
@@ -52,11 +67,24 @@ def diagnose(
 
     # Non-finite values flowing in: explain how they became NaN here.
     if inputs_nonfinite and makes_nan:
+        if name in ("_softmax", "softmax", "_log_softmax", "log_softmax") and x and x.posinf:
+            return (
+                f"softmax got +inf{where}; it subtracts the row max, and inf - inf is NaN",
+                "",
+            )
         if name in ("_softmax", "softmax", "_log_softmax", "log_softmax") and x and x.neginf:
             return (
                 f"softmax got a row where every entry is -inf (a fully masked row){where}, so it computes 0/0",
                 "keep at least one unmasked position per row, or fill masks with torch.finfo(dtype).min instead of -inf",
             )
+        if "scaled_dot_product" in name or "attention" in name:
+            if any(s.neginf for s in inputs):
+                return (
+                    f"attention got a mask where some query row has every key masked (-inf){where}, "
+                    "so its softmax is 0/0",
+                    "make sure every query attends to at least one key, or fill masks with torch.finfo(dtype).min, "
+                    "and zero those rows afterwards",
+                )
         if name in ("mul", "addcmul") or name.startswith("mul"):
             return (f"0 * inf gives NaN{where}", "")
         if name in ("sub", "add", "rsub") or name.startswith("add"):
@@ -96,7 +124,8 @@ def diagnose(
     if name == "log1p" and x and x.min is not None and x.min <= -1:
         return (f"log1p(x) is undefined for x <= -1{where} (min input {x.min:.4g})", "clamp x above -1")
     if name in ("div", "reciprocal"):
-        den = inputs[-1] if name == "div" and len(inputs) >= 2 else x
+        # div with a Python number divisor has a single tensor input: the numerator
+        den = inputs[1] if name == "div" and len(inputs) >= 2 else (x if name == "reciprocal" else None)
         num = inputs[0] if name == "div" and len(inputs) >= 2 else None
         if den and den.zeros:
             if num is not None and num.zeros:
@@ -122,8 +151,8 @@ def diagnose(
                 "this often comes from torch.norm or a distance between identical vectors",
                 "use sqrt(x + eps), or (x.pow(2).sum(dim) + eps).sqrt() instead of norm",
             )
-        if name == "pow":
-            if x.negatives:
+        if name == "pow" and not finite_in_float64:
+            if x.negatives and makes_nan:
                 return (f"a negative number to a fractional power is NaN{where}", "clamp the base to >= 0, or use abs()")
             if x.zeros:
                 return (f"0 to a negative power is inf{where}", EPS_FIX)
