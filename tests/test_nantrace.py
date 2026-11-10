@@ -300,3 +300,16 @@ def test_install_skill_does_not_overwrite(tmp_path):
     dest.write_text("my own edits")
     assert _cli("install-skill", "--dir", str(tmp_path)).returncode == 2
     assert dest.read_text() == "my own edits"
+
+
+def test_explain_finite_tensor_with_masked_input_is_not_found():
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(1, 2, 6, 8) for _ in range(3))
+    mask = torch.zeros(1, 1, 6, 6)
+    mask[..., 4:] = float("-inf")  # some keys masked, no row fully masked
+    with nantrace.trace() as tr:
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    assert not out.isnan().any()
+    assert not tr.explain(out).found

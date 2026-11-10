@@ -487,8 +487,10 @@ class Tracer(TorchDispatchMode):
     # reports -----------------------------------------------------------------
     def explain(self, t: torch.Tensor, context: dict | None = None) -> "Report":
         """Report for one tensor, for example a NaN loss or gradient."""
-        ev = self._lookup(t) if has_nonfinite(t) else None
-        return self.report(ev, context)
+        if not has_nonfinite(t):
+            # A finite tensor has nothing to explain, even if a masked -inf fed into it.
+            return Report(chain=[], n_ops=self.n_ops, context={"not_found": "this tensor has no NaN or Inf", **(context or {})})
+        return self.report(self._lookup(t), context)
 
     def report(self, target: Event | None = None, context: dict | None = None) -> "Report":
         if target is None:
