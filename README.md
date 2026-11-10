@@ -150,7 +150,7 @@ Both check the gradients after every backward pass (the Trainer also checks the 
 
 ## Tested on real bugs
 
-`benchmarks/realworld/` holds the reproducers from 10 public NaN issues (PyTorch, DeepChem, a GNN research repo and others) plus 4 controls that are fixed upstream. `nantrace run` gives the root cause stated in the issue for all 10 and reports nothing for the 4 controls. See `benchmarks/realworld/RESULTS.md`.
+`benchmarks/realworld/` holds 9 NaN bugs: the reproducers from 8 public issues (PyTorch, DeepChem and a GNN research repo) and one common pattern (a hand written binary cross entropy), plus 4 controls whose bugs are already fixed upstream. `nantrace run` gives the stated root cause for all 9 and reports nothing for the 4 controls. See `benchmarks/realworld/RESULTS.md`.
 
 ## The bug that started it
 

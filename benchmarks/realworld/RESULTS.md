@@ -22,7 +22,7 @@ Results on 2026-11-10, torch 2.15.0, macOS arm64 (CPU, and MPS for c13):
 | c11 | pytorch/pytorch#163997 (CPU) | returns zeros on torch 2.15 CPU (negative control) | no report | yes |
 | c13 | pytorch/pytorch#163997 (MPS) | returns zeros on torch 2.15 MPS (negative control) | no report | yes |
 
-10 of 10 bugs found with the right root cause; 0 false reports on 4 controls.
+9 of 9 bugs (8 public issues and 1 common pattern) found with the right root cause; 0 false reports on 4 controls.
 
 Bugs this benchmark found in nantrace itself, now fixed: a Python number divisor was taken as the denominator (c06);
 inf only losses were reported as "no NaN" (c09); custom ops were opaque (c08); a NaN in the unused attention weights
