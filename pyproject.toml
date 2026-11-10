@@ -10,7 +10,21 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = ["torch>=2.4"]
+authors = [{ name = "Aditya Raj" }]
 keywords = ["pytorch", "nan", "debugging", "numerical stability", "deep learning"]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Debuggers",
+]
+
+[project.urls]
+Homepage = "https://github.com/Optimus2007/nantrace"
+Issues = "https://github.com/Optimus2007/nantrace/issues"
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.2"]

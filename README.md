@@ -7,17 +7,17 @@ It started with a NaN in TorchRL's MPPI planner ([pytorch/rl#4717](https://githu
 ## Install
 
 ```bash
-pip install git+https://github.com/Optimus2007/nantrace
+pip install nantrace
 ```
 
-It needs Python 3.10 or newer and PyTorch 2.4 or newer. It is not on PyPI yet.
+It needs Python 3.10 or newer and PyTorch 2.4 or newer.
 
 ## Use it with a coding agent
 
-nantrace ships an MCP server and an agent skill, so Claude Code, Cursor, Codex and other agents can trace a NaN, read a short JSON answer (about 1 KB), and fix the right line instead of wrapping the loss in `nan_to_num`.
+nantrace ships an MCP server and an agent skill, so Claude Code, Cursor, Codex and other agents can trace a NaN, read a short JSON answer (about 1 KB), and see the exact line where the NaN started instead of guessing or wrapping the loss in `nan_to_num`.
 
 ```bash
-pip install "nantrace[mcp] @ git+https://github.com/Optimus2007/nantrace"
+pip install "nantrace[mcp]"
 
 # Claude Code: use the python of the environment that has your project's torch
 claude mcp add nantrace -- /path/to/venv/bin/python -m nantrace mcp
@@ -158,17 +158,17 @@ Run unchanged on the TorchRL reproduction script, nantrace points to `torchrl/mo
 
 ## Overhead
 
-`benchmarks/overhead.py`: 6 layer MLP, width 1024, batch 256, AdamW, MacBook Air M2.
+`benchmarks/overhead.py`: 6 layer MLP, width 1024, batch 256, AdamW. CPU and MPS on a MacBook Air M2, CUDA on an NVIDIA T4 (Kaggle).
 
-| | CPU | MPS |
-|---|---|---|
-| plain training | 1.00x | 1.00x |
-| `nantrace.Guard` | 1.04x | about 1.0x (within noise) |
-| `torch.autograd.detect_anomaly` | 1.36x | 1.7x to 2.1x |
+| | CPU | MPS | CUDA (T4) |
+|---|---|---|---|
+| plain training | 1.00x | 1.00x | 1.00x |
+| `nantrace.Guard` | 1.04x | about 1.0x (within noise) | about 1.0x (within noise) |
+| `torch.autograd.detect_anomaly` | 1.36x | 1.7x to 2.1x | 2.43x |
 
 ## Limits
 
-* Tested so far on PyTorch 2.15 with Python 3.13, on CPU and Apple MPS, with Lightning 2.6 and Transformers 5.22. Not yet tested on CUDA or with multiple GPUs. If you have a GPU, [`examples/cuda_check.ipynb`](examples/cuda_check.ipynb) runs the test suite on Colab in one click, and reports are very welcome.
+* Tested on PyTorch 2.15 with Python 3.13 on CPU and Apple MPS, and on PyTorch 2.11 with CUDA 13 on an NVIDIA T4, with Lightning 2.6 and Transformers 5.22. Not yet tested with multiple GPUs or distributed training. [`examples/cuda_check.ipynb`](https://github.com/Optimus2007/nantrace/blob/main/examples/cuda_check.ipynb) runs the test suite on a Colab GPU in one click, and reports are very welcome.
 * The replay needs the step to be repeatable. Nondeterministic GPU kernels or random data augmentation inside the step can make the NaN disappear on replay; nantrace says so when that happens.
 * Code inside `torch.compile` is not traced op by op yet.
 * With `GradScaler`, pass `check_grads=False`; inf gradients are expected there and the scaler skips those steps.
