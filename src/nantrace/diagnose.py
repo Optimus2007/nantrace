@@ -65,7 +65,7 @@ def diagnose(
         if hit:
             return hit
 
-    # Non-finite values flowing in: explain how they became NaN here.
+    # NaN or Inf values flowing in: explain how they became NaN here.
     if inputs_nonfinite and makes_nan:
         if name in ("_softmax", "softmax", "_log_softmax", "log_softmax") and x and x.posinf:
             return (
@@ -195,7 +195,7 @@ def diagnose(
         )
     if finite_in_float64 is False:
         return (f"{name} is undefined for these inputs{where}", "inspect the input ranges below")
-    return (f"{name} produced non-finite values from finite inputs{where}", "inspect the input ranges below")
+    return (f"{name} produced NaN or Inf from finite inputs{where}", "inspect the input ranges below")
 
 
 _MASKED_NOTE = (

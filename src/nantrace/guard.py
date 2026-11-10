@@ -140,7 +140,7 @@ class Guard:
             what.append(f"loss is {loss.detach().float().reshape(-1)[0].item()}")
         if bad_grads:
             shown = ", ".join(bad_grads[:3]) + (" ..." if len(bad_grads) > 3 else "")
-            what.append(f"{len(bad_grads)} parameter gradients are non-finite ({shown})")
+            what.append(f"{len(bad_grads)} parameter gradients are not finite ({shown})")
         context = {"step": self.steps, "loss_finite": not loss_bad, "bad_grads": bad_grads}
         context["summary"] = f"step {self.steps}: " + " and ".join(what)
 

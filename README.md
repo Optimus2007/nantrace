@@ -2,8 +2,18 @@
 
 Your loss went NaN at step 30,000. nantrace tells you **which op created it, on which line, and why**, and suggests the fix.
 
+It started with a NaN in TorchRL's MPPI planner ([pytorch/rl#4717](https://github.com/pytorch/rl/issues/4717)) that took a long manual search to pin down. PyTorch tells you *that* something is NaN. It rarely tells you *where it began*.
+
+## Install
+
+```bash
+pip install git+https://github.com/Optimus2007/nantrace
 ```
-nantrace: step 137: loss is nan and 6 parameter gradients are non-finite (q.weight, q.bias, k.weight ...)
+
+It needs Python 3.10 or newer and PyTorch 2.4 or newer. It is not on PyPI yet.
+
+```
+nantrace: step 137: loss is nan and 6 parameter gradients are not finite (q.weight, q.bias, k.weight ...)
 
   1. origin forward  aten.exp.default  ->  float32 [16, 8, 8], range [9.345e-42, 4.671e+35], 3 +inf
      at       guard_training.py:21 in forward
@@ -27,7 +37,7 @@ nantrace: step 137: loss is nan and 6 parameter gradients are non-finite (q.weig
 | Finds NaN created in the backward pass | yes, but reports the first bad grad in *reverse* order, often far from the cause | no | yes, mapped to the forward line |
 | Follows inf → NaN back to the op that started it | no | no | yes |
 | Explains the cause (overflow, log(0), 0/0, fully masked row, float16 range, the `torch.where` gradient trap) | no | no | yes |
-| Cost while training | 1.4x to 2x every step | every step | about 0 to 4% (Guard), full tracing only for the bad step |
+| Cost while training | 1.4x to 2x every step | small, but paid every step | about 0 to 4% (Guard), full tracing only for the bad step |
 
 These are the problems people report about `detect_anomaly` in [pytorch/pytorch#160016](https://github.com/pytorch/pytorch/issues/160016), and the reason JAX users have `jax_debug_nans` while PyTorch users get a backward traceback.
 
@@ -92,7 +102,7 @@ and reported nothing for 5 numerically safe functions, including the fixed versi
 
 * `exp` overflow, and `exp` underflow that later becomes 0 / 0 (for example softmax weights that all round to 0)
 * `log` of 0 or negative values, `log(softmax)` and `log(sigmoid)` underflow
-* division by zero, 0 / 0, inf / inf, inf - inf, 0 * inf
+* division by zero, `0 / 0`, `inf / inf`, `inf - inf`, `0 * inf`
 * gradients that are infinite at a point: `sqrt`, `log`, `pow`, `acos`, `asin`, `atanh`, norms and distances at 0
 * the `torch.where(mask, log(x), 0)` trap, where the forward pass is finite but the gradient is NaN
 * softmax over a fully masked row
@@ -103,9 +113,9 @@ and reported nothing for 5 numerically safe functions, including the fixed versi
 
 `benchmarks/realworld/` holds the reproducers from 10 public NaN issues (PyTorch, DeepChem, a GNN research repo and others) plus 4 controls that are fixed upstream. `nantrace run` gives the root cause stated in the issue for all 10 and reports nothing for the 4 controls. See `benchmarks/realworld/RESULTS.md`.
 
-## Real bug found with it
+## The bug that started it
 
-Run unchanged on a TorchRL planning script, nantrace pointed to `torchrl/modules/planners/mppi.py:256` and reported that `exp` underflowed to 0 a few lines earlier, so the softmax weights summed to 0. That is the bug in [pytorch/rl#4717](https://github.com/pytorch/rl/issues/4717), which was found by hand before this tool existed.
+Run unchanged on the TorchRL reproduction script, nantrace points to `torchrl/modules/planners/mppi.py:256` and reports that `exp` underflowed to 0 a few lines earlier, so the softmax weights summed to 0. That is exactly the cause found by hand in [pytorch/rl#4717](https://github.com/pytorch/rl/issues/4717).
 
 ## Overhead
 
@@ -119,10 +129,17 @@ Run unchanged on a TorchRL planning script, nantrace pointed to `torchrl/modules
 
 ## Limits
 
-* Not yet tested on CUDA or with multiple GPUs. Reports from CUDA users are very welcome.
+* Tested so far on PyTorch 2.15 with Python 3.13, on CPU and Apple MPS. Not yet tested on CUDA or with multiple GPUs. Reports from CUDA users are very welcome.
 * The replay needs the step to be repeatable. Nondeterministic GPU kernels or random data augmentation inside the step can make the NaN disappear on replay; nantrace says so when that happens.
 * Code inside `torch.compile` is not traced op by op yet.
 * With `GradScaler`, pass `check_grads=False`; inf gradients are expected there and the scaler skips those steps.
+
+## Related tools
+
+* [`torch.autograd.detect_anomaly`](https://docs.pytorch.org/docs/stable/autograd.html#anomaly-detection) is built in. It checks the backward pass only.
+* [sherlorch](https://github.com/SankaVaas/sherlorch) also builds an op level provenance graph, through `TorchFunctionMode`. It focuses on the forward pass and does not explain causes.
+* [Hugging Face `DebugUnderflowOverflow`](https://huggingface.co/docs/transformers/debugging) records the absolute min and max of every module, which is great for watching values climb in float16.
+* [trainscope](https://github.com/kaelvalen/trainscope) is for loss spikes in long LLM runs rather than NaN.
 
 ## For coding agents
 

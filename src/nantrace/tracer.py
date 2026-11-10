@@ -2,7 +2,7 @@
 
 `Tracer` is a TorchDispatchMode. It sees every aten op in the forward and the
 backward pass, checks outputs for NaN and Inf, and remembers which op first
-produced each non-finite tensor. That lets it walk back from a bad value (a NaN
+produced each not finite tensor. That lets it walk back from a bad value (a NaN
 loss, an inf gradient) to the op where the problem started, instead of the
 place where it was noticed.
 
@@ -297,10 +297,10 @@ class Tracer(TorchDispatchMode):
                 "with torch.tensor or float('-inf')); that is usually intended"
             )
         elif name:
-            cause = f"'{name}' was already non-finite before this code ran (often a previous optimizer step)"
+            cause = f"'{name}' already held NaN or Inf before this code ran (often a previous optimizer step)"
         else:
             cause = (
-                "a tensor entered the traced code already non-finite "
+                "a tensor that already held NaN or Inf entered the traced code "
                 "(input data, a parameter, or a value computed before tracing started)"
             )
         ev = Event(
@@ -429,7 +429,7 @@ class Tracer(TorchDispatchMode):
         return out
 
     def live_events(self) -> set:
-        """Events whose non-finite tensors are still referenced somewhere."""
+        """Events whose not finite tensors are still referenced somewhere."""
         live = set()
         for ref, ev in self._by_id.values():
             t = ref()

@@ -9,7 +9,7 @@ numerical boundary: zeros, constant values, huge or tiny magnitudes, negative
 values, a batch of one, float16 and bfloat16, masks with a fully masked row, and
 integer targets that are all the same value (such as an ignore_index). Each
 mutated call runs forward and backward under the tracer. A finding is kept when
-the output or a gradient is non-finite, with the root cause of the first NaN or
+the output or a gradient is not finite, with the root cause of the first NaN or
 Inf. Findings with the same origin line are merged.
 
 This is meant for tests and CI: library maintainers can fuzz a loss or a layer
@@ -49,7 +49,7 @@ class Finding:
         return (o.op if o else None, loc.file if loc else None, loc.line if loc else None)
 
     def __str__(self) -> str:
-        head = f"nantrace.fuzz: {self.where} becomes non-finite when {self.mutation}"
+        head = f"nantrace.fuzz: {self.where} becomes not finite when {self.mutation}"
         if self.also:
             head += f" (also: {', '.join(self.also[:4])})"
         return head + "\n" + self.report.text()
@@ -136,7 +136,7 @@ def _float_leaves(x: Any) -> list[torch.Tensor]:
 
 
 def _run(fn, args, kwargs, models) -> tuple[str | None, Report | None]:
-    """Call fn once under the tracer. Returns (where, report) for a non-finite result."""
+    """Call fn once under the tracer. Returns (where, report) when the result has NaN or Inf."""
     leaves, spec = tree_flatten((args, kwargs))
     leaves = [
         t.detach().clone().requires_grad_(True) if isinstance(t, torch.Tensor) and t.is_floating_point() else t
