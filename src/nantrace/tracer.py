@@ -43,6 +43,25 @@ _EXP_OPS = {"exp", "exp2"}
 # happen to be NaN or Inf bit patterns. That is only a bug if the value is read
 # before it is written (nn.Linear, for example, fills torch.empty right away).
 _UNINIT_OPS = {"empty", "empty_like", "empty_strided", "empty_permuted", "new_empty", "new_empty_strided"}
+# in place ops that write every element of self without reading it first. The old
+# value of self (often leftover memory from torch.empty) is not an input to them.
+_OVERWRITE_OPS = {
+    "copy_", "fill_", "zero_", "uniform_", "normal_", "bernoulli_", "exponential_",
+    "random_", "cauchy_", "log_normal_", "geometric_",
+}
+
+
+def _overwritten(func, args, kwargs) -> set[int]:
+    """ids of tensors that an op only writes: self of an overwrite op, and out= arguments."""
+    ids = set()
+    if func.overloadpacket.__name__ in _OVERWRITE_OPS and args and isinstance(args[0], torch.Tensor):
+        ids.add(id(args[0]))
+    for a in func._schema.arguments:
+        if a.kwarg_only and a.alias_info is not None and a.alias_info.is_write:
+            t = kwargs.get(a.name)
+            if isinstance(t, torch.Tensor):
+                ids.add(id(t))
+    return ids
 # exp(x) rounds to 0 below about log(smallest subnormal)
 _TINY = {torch.float16: -17.3, torch.bfloat16: -92.0, torch.float32: -103.3, torch.float64: -744.4}
 _TB_RE = re.compile(r'File "(.+?)", line (\d+), in ([^\n]+)(?:\n[ \t]*([^\n]*))?')
@@ -363,6 +382,9 @@ class Tracer(TorchDispatchMode):
         in_t = [t for t in tree_leaves((args, kwargs)) if is_float(t)]
         mutable = func._schema.is_mutable
         if mutable:  # inputs change in place, so look at them first
+            written = _overwritten(func, args, kwargs)
+            if written:  # their old values are not read, so they are not inputs
+                in_t = [t for t in in_t if id(t) not in written]
             pre_bad = [has_nonfinite(t) for t in in_t]
             pre_stats = [None if b else stats(t) for t, b in zip(in_t, pre_bad)]
             pre_kind = [_kind([t]) if b else None for t, b in zip(in_t, pre_bad)]

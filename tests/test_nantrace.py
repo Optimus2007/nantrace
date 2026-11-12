@@ -381,3 +381,37 @@ def test_reading_a_view_of_garbage_is_reported():
             y = buf[:2] * 2.0
     o = origin(tr.explain(y))
     assert o.op.startswith("aten.empty") and "uninitialized" in o.cause
+
+
+def test_fill_of_garbage_is_not_blamed_on_empty():
+    # torch.empty(...).fill_(-inf) is a normal way to build a mask: the old bytes are never read.
+    with _PoisonEmpty():
+        with nantrace.trace(stop="nan") as tr:
+            m = torch.empty(4, 4).fill_(float("-inf"))
+            m[:, 0] = 0.0
+            p = torch.softmax(m, -1)
+    assert torch.isfinite(p).all()
+    o = origin(tr.explain(m))
+    assert not o.op.startswith("aten.empty") and "uninitialized" not in o.cause
+
+
+def test_copy_of_real_nan_into_garbage_blames_the_real_origin():
+    with _PoisonEmpty():
+        with nantrace.trace() as tr:
+            x = torch.tensor([0.0, 1.0])
+            buf = torch.empty(2)
+            buf.copy_(x / x)
+            y = buf * 2.0
+    o = origin(tr.explain(y))
+    assert o.op == "aten.div.Tensor", o.op
+
+
+def test_out_argument_of_garbage_blames_the_real_origin():
+    with _PoisonEmpty():
+        with nantrace.trace() as tr:
+            x = torch.tensor([0.0, 1.0])
+            buf = torch.empty(2)
+            torch.div(x, x, out=buf)
+            y = buf + 1.0
+    o = origin(tr.explain(y))
+    assert o.op.startswith("aten.div"), o.op
