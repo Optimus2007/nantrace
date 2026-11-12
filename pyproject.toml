@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nantrace"
-version = "0.1.0"
+version = "0.1.1"
 description = "Find the op where NaN or Inf first appears in PyTorch training, explain why, and suggest a fix"
 readme = "README.md"
 requires-python = ">=3.10"
