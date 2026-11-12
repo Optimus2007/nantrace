@@ -313,3 +313,71 @@ def test_explain_finite_tensor_with_masked_input_is_not_found():
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
     assert not out.isnan().any()
     assert not tr.explain(out).found
+
+
+# --- uninitialized memory -------------------------------------------------------
+# torch.empty returns leftover bytes, which on some machines happen to be NaN
+# (seen on Linux x86_64 with nn.Linear's weight allocation). This mode makes that
+# deterministic by filling every empty-family result with NaN.
+from torch.utils._python_dispatch import TorchDispatchMode
+
+
+class _PoisonEmpty(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        if func.overloadpacket.__name__ in ("empty", "empty_like", "empty_strided", "new_empty") and out.is_floating_point():
+            with torch.no_grad():
+                out.fill_(float("nan"))
+        return out
+
+
+def test_garbage_in_empty_is_not_blamed_when_overwritten():
+    # nn.Linear allocates with torch.empty and fills it right away: not a bug.
+    with _PoisonEmpty():
+        with nantrace.trace() as tr:
+            model = torch.nn.Linear(4, 3)
+            w = torch.exp(model(torch.ones(2, 4)) * 0 + 100.0)
+            p = w / w.sum(-1, keepdim=True)
+    assert torch.isfinite(model.weight).all()
+    o = origin(tr.explain(p))
+    assert o.op == "aten.exp.default" and "exp overflow" in o.cause
+
+
+def test_reading_garbage_from_empty_is_reported():
+    with _PoisonEmpty():
+        with nantrace.trace() as tr:
+            buf = torch.empty(3)
+            y = buf + 1.0
+    o = origin(tr.explain(y))
+    assert o.op.startswith("aten.empty") and "uninitialized" in o.cause
+    assert "torch.empty(3)" in o.location.code
+    assert "torch.zeros" in o.fix
+
+
+def test_reading_garbage_from_empty_stops_with_stop_nan():
+    with _PoisonEmpty():
+        with pytest.raises(NonFiniteError, match="uninitialized"):
+            with nantrace.trace(stop="nan"):
+                buf = torch.empty(3)
+                _ = buf * 2.0
+
+
+def test_view_of_garbage_is_not_a_read():
+    # Slicing a buffer reads nothing; only filling it and then using it counts.
+    with _PoisonEmpty():
+        with nantrace.trace() as tr:
+            buf = torch.empty(4, 3)
+            for i in range(4):
+                buf.narrow(0, i, 1).copy_(torch.ones(1, 3) * i)
+            y = buf.sum()
+    assert torch.isfinite(y)
+    assert not tr.report().found
+
+
+def test_reading_a_view_of_garbage_is_reported():
+    with _PoisonEmpty():
+        with nantrace.trace() as tr:
+            buf = torch.empty(4, 3)
+            y = buf[:2] * 2.0
+    o = origin(tr.explain(y))
+    assert o.op.startswith("aten.empty") and "uninitialized" in o.cause
