@@ -39,6 +39,10 @@ _SKIP_DIRS = tuple(
     )
 )
 _EXP_OPS = {"exp", "exp2"}
+# ops that return uninitialized memory: their contents are leftover bytes, which can
+# happen to be NaN or Inf bit patterns. That is only a bug if the value is read
+# before it is written (nn.Linear, for example, fills torch.empty right away).
+_UNINIT_OPS = {"empty", "empty_like", "empty_strided", "empty_permuted", "new_empty", "new_empty_strided"}
 # exp(x) rounds to 0 below about log(smallest subnormal)
 _TINY = {torch.float16: -17.3, torch.bfloat16: -92.0, torch.float32: -103.3, torch.float64: -744.4}
 _TB_RE = re.compile(r'File "(.+?)", line (\d+), in ([^\n]+)(?:\n[ \t]*([^\n]*))?')
@@ -319,6 +323,33 @@ class Tracer(TorchDispatchMode):
         self._register(t, ev)
         return ev
 
+    def _note_uninitialized(self, func, bad_outs: list[torch.Tensor]) -> None:
+        """Remember garbage NaN/Inf from an uninitialized allocation without reporting it.
+
+        The event is marked aux, so it stays silent unless a later op reads the tensor
+        before overwriting it; then the aux promotion in __torch_dispatch__ reports it.
+        """
+        frames, inner = _forward_frames()
+        ev = Event(
+            index=self.n_ops,
+            phase="forward",
+            op=str(func),
+            kind=_kind(bad_outs),
+            output=stats(bad_outs[0]),
+            location=frames[-1] if frames else None,
+            inner=inner,
+            stack=frames[-6:],
+            aux=True,
+            cause=(
+                f"{func.overloadpacket.__name__} returns uninitialized memory (leftover bytes that "
+                "happened to be NaN or Inf), and it was read before every element was written"
+            ),
+            fix="use torch.zeros or torch.full instead, or make sure every element is written before it is read",
+        )
+        self._add(ev)
+        for t in bad_outs:
+            self._register(t, ev)
+
     def _add(self, ev: Event) -> None:
         if len(self.events) < self.max_events:
             self.events.append(ev)
@@ -344,6 +375,9 @@ class Tracer(TorchDispatchMode):
         bad_outs = [t for t in outs if has_nonfinite(t)]
         if not bad_outs:
             return out
+        if func.overloadpacket.__name__ in _UNINIT_OPS:
+            self._note_uninitialized(func, bad_outs)
+            return out
 
         if not mutable:
             pre_bad = [has_nonfinite(t) for t in in_t]
@@ -365,7 +399,10 @@ class Tracer(TorchDispatchMode):
         if parent is not None and not ("nan" in out_kind and not input_has_nan):
             for t in bad_outs:  # plain propagation
                 self._register(t, parent)
-            aux_src = next((e for e in self._ancestors(parent) if e.aux), None)
+            # A view (narrow, slice, reshape) reads no values, so it must not turn a silent
+            # event (an unused secondary output, uninitialized memory) into a real one.
+            is_view = getattr(func, "is_view", False)
+            aux_src = None if is_view else next((e for e in self._ancestors(parent) if e.aux), None)
             if aux_src is not None:  # a secondary output turned out to be used
                 for e in self._ancestors(parent):
                     e.aux = False
