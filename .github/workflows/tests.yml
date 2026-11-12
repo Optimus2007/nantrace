@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install CPU torch
+        run: pip install torch numpy --index-url https://download.pytorch.org/whl/cpu
+      - name: Install nantrace
+        run: pip install -e ".[mcp]" pytest
+      - name: Tests
+        run: pytest -q tests
+      - name: Real bug benchmark
+        working-directory: benchmarks/realworld
+        run: python score.py "$(which nantrace)" . | grep '^## '
